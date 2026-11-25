@@ -4,13 +4,14 @@ import argparse
 import fcntl
 import json
 import os
+import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from . import client
+from . import client, lifecycle
 from .storage import Store
 from .util import DEFAULT_HOME, canonical_json, now_ts
 
@@ -37,7 +38,13 @@ class Coordinator:
         self._lock_fd.truncate()
         self._lock_fd.write(str(os.getpid()))
         self._lock_fd.flush()
+        # Keep the historical home-root pid file for the bundled demo, and the
+        # scripts' pids/coordinator.pid for start-all/stop-all.  This runs
+        # only after the singleton flock is won, so a rejected duplicate never
+        # overwrites the active coordinator's pid file.
         (self.home / "coordinator.pid").write_text(str(os.getpid()), encoding="utf-8")
+        lifecycle.write_registration_files(self.home, "coordinator", os.getpid())
+        lifecycle.cleanup_pid_files(self.home, "coordinator-starting")
 
     def close(self) -> None:
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -443,7 +450,16 @@ class Coordinator:
         # status == paused: nothing to send until resume.
 
     def run_forever(self) -> int:
-        self.acquire_singleton()
+        try:
+            # Hold the shared start slot only through singleton/pid-file
+            # acquisition.  stop-all takes the exclusive lock and then owns
+            # the boundary for the whole shutdown.
+            with lifecycle.start_slot(self.home):
+                self.acquire_singleton()
+        except lifecycle.StopInProgress as exc:
+            print(f"refusing coordinator takeover: {exc}", file=sys.stderr, flush=True)
+            return lifecycle.EXIT_BUSY
+
         print(
             f"coordinator {os.getpid()} watching group={self.cluster.get('group')} "
             f"home={self.home} interval={self.interval:.2f}s",

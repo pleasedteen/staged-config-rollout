@@ -45,6 +45,11 @@ cd release-coordinator
 
 # 停止全部本地进程
 ./scripts/stop-all.sh
+
+# 一条命令（通常 10–20 秒，脚本硬检查 <80 秒）验证：
+# kill 协调器 → 前台脚本接手 → stop-all 不漏停、不误杀 PID 复用进程、
+# 停机中拒绝启动、暂停/回退跨停机续接，以及 start/stop 交错。
+timeout 80s ./scripts/verify-lifecycle.sh
 ```
 
 也可以把 `RELCOORD_HOME` 指向其他状态目录。
@@ -137,6 +142,8 @@ kill -9 "$(cat runtime/pids/coordinator.pid)"
 ```
 
 协调器使用 `runtime/coordinator.lock` 上的 `flock` 防止误启动两个 reconciler；旧进程死亡后锁由内核释放。
+
+同一 `RELCOORD_HOME` 的起停边界由 `runtime/lifecycle.lock` 保护：启动取共享槽，`stop-all` 取排他锁并写入 `runtime/lifecycle.json` 的 `stopping` 标记。因此停机期间新的协调器接手、服务启动和重复 `start-all` 会以状态码 `75` 被拒绝。`stop-all` 不只依赖 PID 文件：它会核对 `/proc/<pid>/cmdline`、`--home` 和 PID 启动时间，并扫描该运行目录的真实协调器/服务进程。PID 已被无关进程复用时不会误杀；停机成功后，本目录的在任协调器和服务均已退出，而该无关进程继续运行。停机完成后再显式执行 `start-all.sh` 或 `start-coordinator.sh`，会从 SQLite 接续已接受的暂停或回退。
 
 ## 故障注入
 

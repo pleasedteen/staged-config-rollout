@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from . import lifecycle
 from .storage import Store, load_initial_state
 from .util import DEFAULT_HOME, PROJECT_ROOT, canonical_json, now_ts, pretty_json
 
@@ -339,6 +342,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     home = Path(args.home)
+    try:
+        lifecycle.check_start_allowed(home)
+    except lifecycle.StopInProgress as exc:
+        print(f"refusing service start: {exc}", file=sys.stderr, flush=True)
+        return lifecycle.EXIT_BUSY
+
     service, cluster_port, host = build_service(home, args.name, args.state)
     port = args.port or cluster_port
     if args.faults_json:
@@ -349,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
         daemon_threads = True
 
     server = ReusableServer((host, port), make_handler(service))
+    lifecycle.write_registration_files(home, args.name, os.getpid())
     print(
         f"service {args.name} listening on http://{host}:{port} "
         f"state={service.state_path} effective={service.state['effective']['version']}",
