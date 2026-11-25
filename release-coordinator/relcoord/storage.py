@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS services (
     actual_content TEXT,
     actual_fence INTEGER NOT NULL DEFAULT 0,
     reachable INTEGER NOT NULL DEFAULT 0,
+    peer_name TEXT,
+    identity_ok INTEGER NOT NULL DEFAULT 1,
     last_checked REAL,
     last_error TEXT
 );
@@ -71,9 +73,12 @@ CREATE TABLE IF NOT EXISTS release_services (
     baseline_content TEXT NOT NULL,
     started INTEGER NOT NULL DEFAULT 0,
     applied_confirmed INTEGER NOT NULL DEFAULT 0,
+    apply_attribution TEXT NOT NULL DEFAULT 'verified',
     apply_command_id TEXT NOT NULL,
     apply_attempts INTEGER NOT NULL DEFAULT 0,
     rollback_confirmed INTEGER NOT NULL DEFAULT 0,
+    rollback_attribution TEXT NOT NULL DEFAULT 'verified',
+    baseline_attribution TEXT NOT NULL DEFAULT 'verified',
     rollback_command_id TEXT NOT NULL,
     rollback_attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
@@ -132,6 +137,79 @@ class Store:
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('next_fence', '1')"
             )
+            self.migrate(conn)
+
+    def migrate(self, conn: sqlite3.Connection) -> None:
+        """Add attribution columns to runtimes created before peer-identity checks.
+
+        Pre-existing positive claims (a recorded apply/rollback confirmation, or
+        any baseline snapshot) cannot be trusted until ``relctl verify`` proves
+        they belong to the named service, so legacy claims start in the
+        ``pending_verification`` posture.
+        """
+        rs_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(release_services)")
+        }
+        if "apply_attribution" not in rs_cols:
+            conn.execute(
+                "ALTER TABLE release_services "
+                "ADD COLUMN apply_attribution TEXT NOT NULL DEFAULT 'verified'"
+            )
+            conn.execute(
+                "UPDATE release_services SET apply_attribution='pending_verification' "
+                "WHERE applied_confirmed=1"
+            )
+        if "rollback_attribution" not in rs_cols:
+            conn.execute(
+                "ALTER TABLE release_services "
+                "ADD COLUMN rollback_attribution TEXT NOT NULL DEFAULT 'verified'"
+            )
+            conn.execute(
+                "UPDATE release_services SET rollback_attribution='pending_verification' "
+                "WHERE rollback_confirmed=1"
+            )
+        if "baseline_attribution" not in rs_cols:
+            conn.execute(
+                "ALTER TABLE release_services "
+                "ADD COLUMN baseline_attribution TEXT NOT NULL DEFAULT 'verified'"
+            )
+            # Every old baseline may have been snapshotted from a crossed peer.
+            conn.execute(
+                "UPDATE release_services SET baseline_attribution='pending_verification'"
+            )
+
+        svc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+        if "peer_name" not in svc_cols:
+            conn.execute("ALTER TABLE services ADD COLUMN peer_name TEXT")
+        if "identity_ok" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN identity_ok INTEGER NOT NULL DEFAULT 1"
+            )
+
+    def sync_endpoints_from_cluster(self) -> list[str]:
+        """Copy corrected cluster.json URLs/state paths into the services table."""
+        cluster = self.load_cluster()
+        changed: list[str] = []
+        with self.connect() as conn:
+            for spec in cluster["services"]:
+                name = spec["name"]
+                row = conn.execute(
+                    "SELECT base_url, state_path FROM services WHERE name=?", (name,)
+                ).fetchone()
+                if row is None:
+                    continue
+                url = spec["url"]
+                state_path = spec.get("state_path")
+                if row["base_url"] != url or (
+                    state_path and row["state_path"] != str(state_path)
+                ):
+                    conn.execute(
+                        "UPDATE services SET base_url=?, "
+                        "state_path=COALESCE(?, state_path) WHERE name=?",
+                        (url, str(state_path) if state_path else None, name),
+                    )
+                    changed.append(name)
+        return changed
 
     def initialize_home(
         self,
@@ -297,6 +375,16 @@ class Store:
                 "SELECT * FROM releases WHERE group_name=? ORDER BY created_at DESC, id DESC LIMIT 1",
                 (group,),
             ).fetchone()
+
+    def latest_non_superseded_release(self, group: str = GROUP) -> sqlite3.Row | None:
+        """Most recent release that a newer publish has not replaced."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM releases WHERE group_name=? AND superseded=0 "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (group,),
+            ).fetchone()
+        return row or self.latest_release(group)
 
     def get_release(self, release_id: str) -> sqlite3.Row:
         with self.connect() as conn:
@@ -574,3 +662,9 @@ class Store:
             except Exception:
                 conn.rollback()
                 raise
+
+    def verify_attribution(self, **kwargs: Any) -> dict[str, Any]:
+        """Convenience wrapper around :func:`relcoord.verify.verify_runtime`."""
+        from .verify import verify_runtime
+
+        return verify_runtime(self.home, **kwargs)

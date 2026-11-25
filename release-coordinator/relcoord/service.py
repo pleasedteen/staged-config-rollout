@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import socket
 import threading
 import time
@@ -24,6 +25,13 @@ class ServiceAPIError(Exception):
 
 class LostReceipt(Exception):
     """Raised after durable apply when the injected fault eats the HTTP response."""
+
+
+# Canonical managed command id: apply|rollback-<rel-YYYYmmddHHMMSS-hex6>-<name>.
+# Used only as a fallback identity claim for old clients that omit service_name.
+_MANAGED_COMMAND_RE = re.compile(
+    r"^(?:apply|rollback)-(rel-\d{14}-[0-9a-fA-F]{6})-(?P<name>.+)$"
+)
 
 
 class MockService:
@@ -155,6 +163,27 @@ class MockService:
         if not isinstance(content, dict):
             raise ServiceAPIError(400, "invalid_request", "content must be an object")
 
+        intended_name = None
+        for key in ("service_name", "target_service", "expected_service", "service", "name"):
+            if payload.get(key) is not None:
+                intended_name = payload[key]
+                break
+        if intended_name is None:
+            # Backwards-compatible fallback for callers that don't send the
+            # explicit field: managed command ids end with the target name.
+            match = _MANAGED_COMMAND_RE.match(command_id)
+            if match:
+                intended_name = match.group("name")
+        if intended_name is not None and str(intended_name) != self.name:
+            # Crossed endpoint / misdirected instruction. This MUST happen
+            # before taking the lock or touching durable state, so the wrong
+            # machine never persists another service's configuration.
+            raise ServiceAPIError(
+                409,
+                "identity_mismatch",
+                f"endpoint belongs to {self.name!r}; instruction targets {intended_name!r}",
+            )
+
         with self.lock:
             self._delay_if_configured_locked()
             current_fence = int(self.state.get("fence", 0))
@@ -181,6 +210,9 @@ class MockService:
                 return {
                     "ok": True,
                     "duplicate": True,
+                    "service": self.name,
+                    "service_name": self.name,
+                    "name": self.name,
                     "command_id": command_id,
                     "effective": self.state["effective"],
                     "fence": self.state["fence"],
@@ -239,6 +271,9 @@ class MockService:
             return {
                 "ok": True,
                 "duplicate": False,
+                "service": self.name,
+                "service_name": self.name,
+                "name": self.name,
                 "command_id": command_id,
                 "effective": effective,
                 "fence": request_fence,

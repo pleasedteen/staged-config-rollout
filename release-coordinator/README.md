@@ -5,7 +5,9 @@
 - 持久化发布协调器：批次推进、暂停/继续、回退、重试、故障恢复。
 - 6 个可独立启动、杀掉、重启的模拟服务：实际生效配置保存在各自 JSON 文件中。
 - SQLite 持久化发布状态、批次确认、每服务发布前基线、暂停/回退决定和事件。
-- 丢失指令、丢失回执、重复指令、延迟、服务失联、协调器被 `SIGKILL` 的故障演示。
+- 对端归属校验：端点串到另一台服务时拒绝写入、拒绝确认，实时状态不冒用对端配置。
+- 旧运行目录原地核验：`relctl verify` 保留有证据的确认、安全补齐缺漏、把无法核实归属的确认/基线标为待核实。
+- 丢失指令、丢失回执、重复指令、延迟、服务失联、协调器被 `SIGKILL`、串端点的故障演示。
 
 ## 一条命令跑故障演示
 
@@ -14,7 +16,7 @@
 # 或 python3 -m relcoord.demo
 ```
 
-演示使用临时目录和随机端口，通常 **3–5 秒**完成（远低于 80 秒），并执行约 50 项自检。内容包括：
+演示使用临时目录和随机端口，通常 **5–8 秒**完成（远低于 80 秒），并执行 78 项自检。内容包括：
 
 1. 六个服务初始版本不同（`v1.0.0` / `v1.4.2` / `v0.9.7`）。
 2. svc-2 注入指令丢失、回执丢失和延迟；协调器用同一 command ID 重试，服务识别重复且不重复写历史。
@@ -24,6 +26,15 @@
 6. 失联服务拖住当前批完成和后续批次；恢复后自动补齐。
 7. 进行中发布可回退；已开始批次恢复，未开始批次不动；失联者恢复后才显示回退完成。
 8. 回退确认后，迟到的旧发布指令因更低 fence 被 `409 stale_fence` 拒绝。
+9. 串端点与重启接手（独立的旧 schema 运行目录）：
+   - svc-3 的端点被串到 svc-1，且 svc-3 未启动；新代码在服务端以 `409 identity_mismatch`
+     拒绝误投的写入，**不会把 svc-3 的配置写到 svc-1**，也不会把 svc-3 误判为完成；
+     `relctl status` 显示 `PEER-MISMATCH` 而非冒用 svc-1 的实时配置。
+   - 修正端点后执行 `relctl verify --sync-endpoints`：有持久化命令证据的确认保留，
+     “已落盘但未记账”的确认安全补齐，无法核实归属的假确认和污染基线被标为
+     `pending_verification`（待核实），阻止推进/回退。
+   - `SIGKILL` 协调器后重启接手：幂等重试补齐真实 svc-3 并完成发布；
+     未核实基线阻止回退写入，核实后回退才完成。
 
 单元测试：
 
@@ -138,6 +149,43 @@ kill -9 "$(cat runtime/pids/coordinator.pid)"
 
 协调器使用 `runtime/coordinator.lock` 上的 `flock` 防止误启动两个 reconciler；旧进程死亡后锁由内核释放。
 
+## 串端点与旧运行目录核验
+
+每个服务在 `/health`、`/state` 和 `/apply` 响应中声明自己的名字；协调器下发
+apply/rollback 时携带目标 `service_name`。因此当两个服务被串到同一端点时：
+
+- 错误的对端在写盘前直接返回 `409 identity_mismatch`，**配置不会写到另一台**；
+- 协调器不会把该响应当成目标服务的确认，发布/批次不会因此推进或完成；
+- 探测和 `relctl status` 发现自报名字不符时标记 `PEER-MISMATCH`，不把该对端的
+  `effective` 配置当作目标服务的实时状态。
+
+旧运行目录（旧 schema，曾可能记录串端点造成的假确认/污染基线）修正
+`cluster.json` 端点后，在**原地**执行：
+
+```bash
+# 把 cluster.json 中修正后的 URL/state_path 同步进 SQLite，并核验
+./relctl verify --sync-endpoints
+
+./relctl verify --json      # 机器可读报告
+./relctl verify --strict    # 仍有待核实项时以退出码 3 结束
+```
+
+核验对象是“当前活动发布；否则最近一次 `superseded=0` 的发布”。证据来自各服务
+**自己的** `services/<name>.json`（即使进程未启动也可读）以及名字校验通过的实时端点：
+
+- 命令 ID 出现在本服务 `seen_commands`/`history` 中：确认归属成立，予以保留；
+  若 SQLite 漏记确认，则安全补齐（backfill）；
+- 无法用证据归属的已有确认 → `apply_attribution`/`rollback_attribution =
+  pending_verification`（文本标 `?` / `待核实`），不计入完成数，不能推进发布；
+- 无法在本服务历史/生效配置或自带 initial-state 中得到佐证的回退基线 →
+  `baseline_attribution = pending_verification`，协调器**不会**把该基线推给服务恢复，
+  回退保持 `rolling_back`，直到基线被修正并核实。
+
+协调器启动时会自动把旧 schema 的既有确认/基线迁移为待核实姿态；apply 会用稳定命令 ID
+幂等重试以重新取得归属确认，rollback 则只会在基线归属核实后下发。
+
+命令别名：`reverify`、`doctor`、`repair`、`verify-attribution` 等。
+
 ## 故障注入
 
 ```bash
@@ -183,6 +231,7 @@ curl -s http://127.0.0.1:9301/state | python3 -m json.tool
 ## 关键实现约定
 
 - **指令幂等**：每服务/操作有稳定 command ID（如 `apply-<release>-<service>`），服务持久化 `seen_commands`，重复回执/重试返回同一结果且不重复追加配置历史。
+- **对端归属**：apply/rollback 携带目标 `service_name`，服务在任何持久化之前拒绝名字不符的指令（`409 identity_mismatch`）；所有响应/状态带自报服务名，协调器与状态查询据此识别串端点。归属列（`apply_attribution`/`rollback_attribution`/`baseline_attribution`）为 `pending_verification` 的确认或基线不得用于推进/恢复。
 - **fence 防迟到写**：提交发布分配 apply fence；接受回退分配更大的 rollback fence。服务持久化已见最大 fence，回退确认后更低的旧发布指令返回 `409 stale_fence`。
 - **baseline**：提交发布时从 SQLite 最后实际状态（初始化时来自 `data/initial-state.json`）保存每服务自己的版本和内容。
 - **并发批次调用**：同一批服务并发下发，避免一个失联服务的网络超时阻塞同批其他服务。

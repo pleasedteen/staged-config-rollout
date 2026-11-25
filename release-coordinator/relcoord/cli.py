@@ -11,6 +11,7 @@ from . import client
 from .status import build_status, render_status
 from .storage import Store
 from .util import DEFAULT_HOME, RelCoordError, pretty_json
+from .verify import render_verify_report, verify_runtime
 
 
 def _home_default() -> str:
@@ -90,6 +91,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    report = verify_runtime(
+        args.home,
+        release_id=getattr(args, "release", None),
+        sync_endpoints=bool(args.sync_endpoints),
+        live=not args.no_live,
+        advance=not args.no_advance,
+    )
+    if args.json:
+        print(pretty_json(report))
+    else:
+        print(render_verify_report(report))
+    if args.strict and report["summary"]["pending_verification"]:
+        return 3
+    return 0
+
+
 def cmd_faults(args: argparse.Namespace) -> int:
     store = Store(args.home)
     svc = store.get_service(args.service)
@@ -149,6 +167,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--json", action="store_true")
     p_status.add_argument("--no-live", action="store_true", help="do not contact services; use SQLite state")
     p_status.set_defaults(func=cmd_status)
+
+    p_verify = sub.add_parser(
+        "verify",
+        parents=[common],
+        aliases=[
+            "reverify",
+            "doctor",
+            "repair",
+            "audit-attribution",
+            "check-attribution",
+            "verify-attribution",
+            "verify-release",
+        ],
+        help="in place verify peer attribution of the active/latest non-superseded release",
+    )
+    p_verify.add_argument("--json", action="store_true", help="machine-readable verification report")
+    p_verify.add_argument("--release", default=None, help="verify a specific release id instead of active/latest non-superseded")
+    p_verify.add_argument(
+        "--sync-endpoints",
+        action="store_true",
+        help="copy corrected URLs/state paths from cluster.json into SQLite before verifying",
+    )
+    p_verify.add_argument("--no-live", action="store_true", help="skip live endpoint probes; use state files/DB only")
+    p_verify.add_argument("--no-advance", action="store_true", help="do not advance/complete the state machine after repair")
+    p_verify.add_argument("--strict", action="store_true", help="exit 3 if any item remains pending verification")
+    p_verify.set_defaults(func=cmd_verify)
 
     p_fault = sub.add_parser("faults", parents=[common], help="configure mock-service fault injection")
     p_fault.add_argument("--service", required=True)
