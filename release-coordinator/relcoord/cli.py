@@ -159,6 +159,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("service", help="run a mock service; run `relctl service --help` for options")
     sub.add_parser("coordinator", help="run coordinator; run `relctl coordinator --help` for options")
     sub.add_parser("demo", help="run the self-checking fault demo")
+    sub.add_parser(
+        "verify",
+        help="verify per-round probe byte budget (2 KiB), restarts, same-name content swap and rollback",
+    )
     return parser
 
 
@@ -178,6 +182,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .demo import main as demo_main
 
         return demo_main(args_list[1:])
+    if args_list and args_list[0] == "verify":
+        from .verify import main as verify_main
+
+        return verify_main(args_list[1:])
 
     parser = build_parser()
     args = parser.parse_args(args_list)

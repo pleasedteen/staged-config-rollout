@@ -8,10 +8,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .storage import Store, load_initial_state
-from .util import DEFAULT_HOME, PROJECT_ROOT, canonical_json, now_ts, pretty_json
+from .util import (
+    DEFAULT_HOME,
+    PROJECT_ROOT,
+    canonical_json,
+    content_hash,
+    now_ts,
+    pretty_json,
+)
 
 
 class ServiceAPIError(Exception):
@@ -75,6 +82,46 @@ class MockService:
     def public_state(self) -> dict[str, Any]:
         with self.lock:
             return json.loads(json.dumps(self.state))
+
+    def observe(self, known_version: str, known_hash: str, known_fence: int) -> dict[str, Any]:
+        """Digest probe used by the coordinator's background reconciliation loop.
+
+        When the caller already knows the exact effective version, content hash
+        and fence, the reply stays tiny (no history, no content, no command
+        bookkeeping). Any mismatch — including a same-named version whose
+        content differs, or a cold coordinator with empty fingerprints — is
+        answered with the full effective configuration so the observer can
+        refresh its durable record for offline queries and later rollbacks.
+        """
+        with self.lock:
+            effective = self.state["effective"]
+            fence = int(self.state.get("fence", 0))
+            version = str(effective.get("version"))
+            digest = content_hash(effective.get("content"))
+            unchanged = bool(
+                known_hash
+                and known_version == version
+                and known_hash == digest
+                and int(known_fence) == fence
+            )
+            body: dict[str, Any] = {
+                "ok": True,
+                "name": self.name,
+                "changed": not unchanged,
+                "effective": {
+                    "version": version,
+                    "content_hash": digest,
+                },
+                "fence": fence,
+            }
+            if unchanged:
+                return body
+            body["effective"] = {
+                "version": version,
+                "content": effective.get("content"),
+                "content_hash": digest,
+            }
+            return body
 
     def update_faults(self, patch: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -281,6 +328,15 @@ def make_handler(service: MockService) -> type[BaseHTTPRequestHandler]:
                     body = service.public_state()
                     body["ok"] = True
                     self._send_json(200, body)
+                elif parsed.path == "/observe":
+                    query = parse_qs(parsed.query)
+                    known_version = (query.get("version") or [""])[0]
+                    known_hash = (query.get("content_hash") or [""])[0]
+                    try:
+                        known_fence = int((query.get("fence") or ["0"])[0])
+                    except ValueError:
+                        raise ServiceAPIError(400, "invalid_request", "fence must be an integer")
+                    self._send_json(200, service.observe(known_version, known_hash, known_fence))
                 else:
                     self._send_json(404, {"ok": False, "error": "not_found"})
             except Exception as e:  # pragma: no cover - defensive server boundary

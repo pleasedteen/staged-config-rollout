@@ -24,6 +24,24 @@
 6. 失联服务拖住当前批完成和后续批次；恢复后自动补齐。
 7. 进行中发布可回退；已开始批次恢复，未开始批次不动；失联者恢复后才显示回退完成。
 8. 回退确认后，迟到的旧发布指令因更低 fence 被 `409 stale_fence` 拒绝。
+9. 后台探测在配置不变时只传输摘要，每服务每轮响应体远低于 2 KiB。
+
+## 一条命令验证逐轮传输量与恢复
+
+```bash
+./relctl verify
+# 或 python3 -m relcoord verify
+```
+
+在临时 home 中用 **大于 2 KiB 的大配置**启动 6 个真实服务和协调器，约 6 秒完成、执行数百项断言：
+
+- 配置与生效状态不变时，每台服务每轮后台探测响应体 ≤ 2 KiB（实测约 130 B），且**不发生任何全量搬运**；
+- 服务进程、协调器进程分别被 `SIGKILL` 重启后，预算仍然成立；
+- 模拟冷协调器（SQLite 中无内容指纹）时，恰好发生一次全量观测，随后立即回到摘要；
+- **同版本名换成不同内容**后，首次成功探测即拉取完整新观测写入 SQLite，供 `status --no-live` 离线查询和后续回退使用；
+- 回执丢失的幂等重试、回退恢复各自基线、迟到旧指令 `409 stale_fence` 等既有行为保持不变。
+
+逐轮逐服务的实际响应字节数追加记录在 `runtime/probe_traffic.jsonl`。
 
 单元测试：
 
@@ -182,19 +200,23 @@ curl -s http://127.0.0.1:9301/state | python3 -m json.tool
 
 ## 关键实现约定
 
+- **后台探测只传摘要**：协调器每轮调用服务的 `GET /observe?version=&content_hash=&fence=`，参数是 SQLite 中记录的上次完整观测指纹（`sha256` 内容摘要取 16 位）。三者一致时服务只回约 130 B 的摘要（无 content、无 history、无 command 账本）；任一不一致——包括**同版本名但内容被换**、冷协调器指纹为空、服务端 fence 变化——才回一次完整 content，协调器随即刷新 SQLite 中的完整观测并恢复摘要模式。`GET /state` 仍返回完整状态，专供 `relctl status` 实时查询，不参与后台轮询。
 - **指令幂等**：每服务/操作有稳定 command ID（如 `apply-<release>-<service>`），服务持久化 `seen_commands`，重复回执/重试返回同一结果且不重复追加配置历史。
 - **fence 防迟到写**：提交发布分配 apply fence；接受回退分配更大的 rollback fence。服务持久化已见最大 fence，回退确认后更低的旧发布指令返回 `409 stale_fence`。
 - **baseline**：提交发布时从 SQLite 最后实际状态（初始化时来自 `data/initial-state.json`）保存每服务自己的版本和内容。
 - **并发批次调用**：同一批服务并发下发，避免一个失联服务的网络超时阻塞同批其他服务。
+- **传输量留痕**：每轮探测把每服务响应字节、是否全量、合计字节追加到 `probe_traffic.jsonl`，供 `relctl verify` 和人工审计。
+- **旧库平滑升级**：`services` 表新增 `actual_content_hash`、`last_probe_bytes`、`last_probe_changed` 列；协调器启动时自动 `ALTER TABLE` 并从已存完整 content 回填指纹。
 
 ## 目录
 
 ```text
-relcoord/            Python 包：CLI、协调器、模拟服务、存储、状态渲染、演示
+relcoord/            Python 包：CLI、协调器、模拟服务、存储、状态渲染、演示、传输量验证
 configs/             自带目标配置
 data/                自带各服务初始状态
 faults/              自带故障演示参数
 scripts/             启动/重启/停止脚本
-tests/               轻量状态机与 fence 单元测试
+tests/               轻量状态机、fence 与摘要探测单元测试
 run_demo.sh          一条命令端到端故障演示
+relctl verify        一条命令验证逐轮传输量预算与恢复结果
 ```

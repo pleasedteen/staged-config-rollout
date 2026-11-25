@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from relcoord.coordinator import Coordinator
-from relcoord.service import MockService, ServiceAPIError
+from relcoord.service import MockService, ServiceAPIError, make_handler
 from relcoord.storage import Store
-from relcoord.util import PROJECT_ROOT
+from relcoord.util import PROJECT_ROOT, content_hash
 
 V2_CONFIG = PROJECT_ROOT / "configs" / "target-v2.json"
 BATCHES = [
@@ -130,6 +132,141 @@ class MockServiceFenceTests(unittest.TestCase):
             self.assertEqual(ctx.exception.status, 409)
             self.assertEqual(ctx.exception.code, "stale_fence")
             self.assertEqual(service.public_state()["effective"]["version"], "v1")
+
+
+class DigestObserveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.td = Path(self._tmp.name)
+        self.content = {"blob": "A" * 3000}
+        self.service = MockService(
+            "svc-d",
+            self.td / "svc-d.json",
+            {"svc-d": {"version": "v1", "content": self.content}},
+        )
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_unchanged_observation_is_compact(self) -> None:
+        digest = content_hash(self.content)
+        body = self.service.observe("v1", digest, 0)
+        self.assertFalse(body["changed"])
+        self.assertNotIn("content", body["effective"])
+        self.assertEqual(body["effective"]["content_hash"], digest)
+        # Compact summaries must fit the 2 KiB per-service per-round budget.
+        import json as _json
+
+        self.assertLess(len(_json.dumps(body).encode("utf-8")), 256)
+
+    def test_same_version_different_content_forces_full_observation(self) -> None:
+        digest = content_hash(self.content)
+        # Same version name, different content behind it.
+        self.service.state["effective"] = {"version": "v1", "content": {"blob": "B" * 3000}}
+        body = self.service.observe("v1", digest, 0)
+        self.assertTrue(body["changed"])
+        self.assertIn("content", body["effective"])
+        self.assertEqual(body["effective"]["content"], {"blob": "B" * 3000})
+        self.assertEqual(body["effective"]["content_hash"], content_hash({"blob": "B" * 3000}))
+
+    def test_fence_and_version_mismatches_force_full_observation(self) -> None:
+        digest = content_hash(self.content)
+        self.assertTrue(self.service.observe("v2", digest, 0)["changed"])
+        self.assertTrue(self.service.observe("v1", "deadbeef", 0)["changed"])
+        self.assertTrue(self.service.observe("v1", digest, 9)["changed"])
+        # An empty fingerprint (cold coordinator) always triggers a full fetch.
+        cold = self.service.observe("", "", 0)
+        self.assertTrue(cold["changed"])
+        self.assertIn("content", cold["effective"])
+
+
+class CoordinatorProbeTrafficTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from relcoord.demo import free_tcp_ports
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.port = free_tcp_ports(1)[0]
+        self.store = Store(self.home)
+        self.store.initialize_home(names=["svc-1"], ports=[self.port])
+        spec = self.store.load_cluster()["services"][0]
+        self.state_path = Path(spec["state_path"])
+        # Remove the seeded state file so MockService boots from the explicit
+        # large initial configuration below instead of the bundled small one.
+        self.state_path.unlink()
+        self.big = {"blob": "C" * 4000}
+        self.service = MockService(
+            "svc-1",
+            self.state_path,
+            {"svc-1": {"version": "v1", "content": self.big}},
+        )
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), make_handler(self.service))
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.coordinator = Coordinator(self.home)
+
+    def tearDown(self) -> None:
+        self.coordinator.close()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self._tmp.cleanup()
+
+    def test_probe_rounds_and_drift_refresh(self) -> None:
+        # Round 1: seeded fingerprints already match -> compact.
+        self.coordinator.probe_services()
+        self.coordinator.probe_services()
+        row = self.store.get_service("svc-1")
+        self.assertEqual(row["last_probe_changed"], 0)
+        self.assertLessEqual(row["last_probe_bytes"], 256)
+
+        # Same version name, swapped content -> one full observation, then tiny.
+        self.service.state["effective"] = {"version": "v1", "content": {"blob": "D" * 4000}}
+        self.coordinator.probe_services()
+        row = self.store.get_service("svc-1")
+        self.assertEqual(row["last_probe_changed"], 1)
+        self.assertGreater(row["last_probe_bytes"], 2 * 1024)
+        import json as _json
+
+        self.assertEqual(
+            row["actual_content"],
+            _json.dumps({"blob": "D" * 4000}, sort_keys=True, separators=(",", ":")),
+        )
+        self.coordinator.probe_services()
+        row = self.store.get_service("svc-1")
+        self.assertEqual(row["last_probe_changed"], 0)
+        self.assertLessEqual(row["last_probe_bytes"], 256)
+
+        rounds = [
+            _json.loads(line)
+            for line in self.store.probe_traffic_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(rounds), 4)
+        self.assertTrue(all("total_response_bytes" in r for r in rounds))
+
+    def test_cold_coordinator_backfills_full_observation(self) -> None:
+        with self.store.connect() as conn:
+            conn.execute(
+                "UPDATE services SET actual_content_hash=NULL, actual_content=NULL"
+            )
+            conn.commit()
+        self.coordinator.probe_services()
+        row = self.store.get_service("svc-1")
+        self.assertEqual(row["last_probe_changed"], 1)
+        self.assertGreater(row["last_probe_bytes"], 2 * 1024)
+        self.assertIsNotNone(row["actual_content"])
+        self.assertEqual(row["actual_content_hash"], content_hash(self.big))
+
+        self.coordinator.probe_services()
+        row = self.store.get_service("svc-1")
+        self.assertEqual(row["last_probe_changed"], 0)
+        self.assertLessEqual(row["last_probe_bytes"], 256)
+
+    def test_unreachable_service_records_zero_bytes(self) -> None:
+        self.httpd.shutdown()
+        self.coordinator.probe_services()
+        row = self.store.get_service("svc-1")
+        self.assertEqual(row["reachable"], 0)
+        self.assertEqual(row["last_probe_bytes"], 0)
 
 
 if __name__ == "__main__":

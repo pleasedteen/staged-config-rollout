@@ -12,7 +12,7 @@ from typing import Any
 
 from . import client
 from .storage import Store
-from .util import DEFAULT_HOME, canonical_json, now_ts
+from .util import DEFAULT_HOME, canonical_json, content_hash, now_ts
 
 
 class Coordinator:
@@ -23,6 +23,7 @@ class Coordinator:
         self.cluster = self.store.load_cluster()
         self.pool = ThreadPoolExecutor(max_workers=max(8, len(self.cluster["services"]) + 2))
         self._lock_fd: Any | None = None
+        self._probe_round = 0
 
     def acquire_singleton(self) -> None:
         self.store.init_db()
@@ -49,54 +50,158 @@ class Coordinator:
             self._lock_fd.close()
 
     def probe_services(self) -> None:
+        """One digest-based background probe round.
+
+        Each service is asked via GET /observe about the version, content hash
+        and fence the coordinator already holds in SQLite. While the effective
+        configuration is unchanged the response is a compact summary, so a
+        stable large configuration is never shipped round after round — even
+        when a service or the coordinator itself restarts. A changed
+        observation (including a same-named version with different content)
+        triggers one full-content response and the complete observation is
+        refreshed in SQLite for offline queries and later rollbacks.
+        """
         services = self.store.list_services()
         future_map = {
-            self.pool.submit(client.fetch_state, row["base_url"], 0.65): row
+            self.pool.submit(
+                client.fetch_observation,
+                row["base_url"],
+                version=row["actual_version"] or "",
+                content_hash=row["actual_content_hash"] or "",
+                fence=int(row["actual_fence"] or 0),
+                timeout=0.65,
+            ): row
             for row in services
         }
-        updates: list[tuple[Any, ...]] = []
+        results: list[dict[str, Any]] = []
         for future, row in future_map.items():
             try:
-                state = future.result()
-                effective = state.get("effective") or {}
-                content = effective.get("content")
-                updates.append(
-                    (
-                        1,
-                        effective.get("version"),
-                        canonical_json(content) if content is not None else None,
-                        int(state.get("fence", row["actual_fence"] or 0)),
-                        now_ts(),
-                        None,
-                        row["name"],
-                    )
+                observation, response_bytes = future.result()
+                results.append(
+                    {
+                        "name": row["name"],
+                        "ok": True,
+                        "observation": observation,
+                        "response_bytes": int(response_bytes),
+                    }
                 )
             except Exception as e:
-                updates.append((0, None, None, None, now_ts(), str(e)[:300], row["name"]))
+                results.append(
+                    {
+                        "name": row["name"],
+                        "ok": False,
+                        "error": str(e)[:300],
+                        "response_bytes": 0,
+                    }
+                )
 
-        if not updates:
-            return
+        ts = now_ts()
+        per_service: dict[str, dict[str, Any]] = {}
         with self.store.connect() as conn:
-            for reachable, version, content, fence, ts, error, name in updates:
-                if reachable:
+            for result in results:
+                name = result["name"]
+                if not result["ok"]:
+                    conn.execute(
+                        """
+                        UPDATE services
+                        SET reachable=0, last_checked=?, last_error=?,
+                            last_probe_bytes=0, last_probe_changed=NULL
+                        WHERE name=?
+                        """,
+                        (ts, result["error"], name),
+                    )
+                    per_service[name] = {
+                        "ok": False,
+                        "response_bytes": 0,
+                        "changed": None,
+                        "error": result["error"],
+                    }
+                    continue
+
+                observation = result["observation"]
+                response_bytes = result["response_bytes"]
+                effective = observation.get("effective") or {}
+                fence = int(observation.get("fence", 0))
+                if observation.get("changed"):
+                    content = effective.get("content")
+                    if content is None:
+                        error = "observe_changed_without_content"
+                        conn.execute(
+                            """
+                            UPDATE services
+                            SET reachable=0, last_checked=?, last_error=?,
+                                last_probe_bytes=?, last_probe_changed=1
+                            WHERE name=?
+                            """,
+                            (ts, error, response_bytes, name),
+                        )
+                        per_service[name] = {
+                            "ok": False,
+                            "response_bytes": response_bytes,
+                            "changed": True,
+                            "error": error,
+                        }
+                        continue
+                    digest = effective.get("content_hash") or content_hash(content)
                     conn.execute(
                         """
                         UPDATE services
                         SET reachable=1, actual_version=?, actual_content=?,
-                            actual_fence=?, last_checked=?, last_error=NULL
+                            actual_content_hash=?, actual_fence=?,
+                            last_checked=?, last_error=NULL,
+                            last_probe_bytes=?, last_probe_changed=1
                         WHERE name=?
                         """,
-                        (version, content, fence, ts, name),
+                        (
+                            effective.get("version"),
+                            canonical_json(content),
+                            digest,
+                            fence,
+                            ts,
+                            response_bytes,
+                            name,
+                        ),
                     )
+                    per_service[name] = {
+                        "ok": True,
+                        "response_bytes": response_bytes,
+                        "changed": True,
+                        "fence": fence,
+                        "version": effective.get("version"),
+                        "content_hash": digest,
+                    }
                 else:
+                    # Nothing changed: keep the complete observation in SQLite
+                    # untouched and only refresh reachability/timestamps.
+                    digest = effective.get("content_hash")
                     conn.execute(
                         """
                         UPDATE services
-                        SET reachable=0, last_checked=?, last_error=?
+                        SET reachable=1, last_checked=?, last_error=NULL,
+                            actual_fence=?, last_probe_bytes=?, last_probe_changed=0
                         WHERE name=?
                         """,
-                        (ts, error, name),
+                        (ts, fence, response_bytes, name),
                     )
+                    per_service[name] = {
+                        "ok": True,
+                        "response_bytes": response_bytes,
+                        "changed": False,
+                        "fence": fence,
+                        "version": effective.get("version"),
+                        "content_hash": digest,
+                    }
+            conn.commit()
+
+        self._probe_round += 1
+        self.store.append_probe_round(
+            {
+                "round": self._probe_round,
+                "ts": ts,
+                "total_response_bytes": sum(item["response_bytes"] for item in results),
+                "services": per_service,
+            }
+        )
 
     def _apply_one(
         self,
@@ -189,12 +294,15 @@ class Coordinator:
                     conn.execute(
                         """
                         UPDATE services
-                        SET reachable=1, actual_version=?, actual_content=?, last_checked=?, last_error=NULL
+                        SET reachable=1, actual_version=?, actual_content=?,
+                            actual_content_hash=?, last_checked=?,
+                            last_error=NULL, last_probe_changed=NULL
                         WHERE name=?
                         """,
                         (
                             eff.get("version"),
                             canonical_json(eff.get("content")),
+                            content_hash(eff.get("content")),
                             now_ts(),
                             rs["service_name"],
                         ),
@@ -357,12 +465,15 @@ class Coordinator:
                         conn.execute(
                             """
                             UPDATE services
-                            SET reachable=1, actual_version=?, actual_content=?, last_checked=?, last_error=NULL
+                            SET reachable=1, actual_version=?, actual_content=?,
+                                actual_content_hash=?, last_checked=?,
+                                last_error=NULL, last_probe_changed=NULL
                             WHERE name=?
                             """,
                             (
                                 eff.get("version"),
                                 canonical_json(eff.get("content")),
+                                content_hash(eff.get("content")),
                                 now_ts(),
                                 rs["service_name"],
                             ),

@@ -14,6 +14,7 @@ from .util import (
     ConflictError,
     NotFoundError,
     canonical_json,
+    content_hash,
     now_ts,
 )
 
@@ -32,10 +33,13 @@ CREATE TABLE IF NOT EXISTS services (
     initial_content TEXT NOT NULL,
     actual_version TEXT,
     actual_content TEXT,
+    actual_content_hash TEXT,
     actual_fence INTEGER NOT NULL DEFAULT 0,
     reachable INTEGER NOT NULL DEFAULT 0,
     last_checked REAL,
-    last_error TEXT
+    last_error TEXT,
+    last_probe_bytes INTEGER NOT NULL DEFAULT 0,
+    last_probe_changed INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS releases (
@@ -113,6 +117,7 @@ class Store:
         self.logs_dir = self.home / "logs"
         self.pids_dir = self.home / "pids"
         self.lock_path = self.home / "coordinator.lock"
+        self.probe_traffic_path = self.home / "probe_traffic.jsonl"
 
     def connect(self) -> sqlite3.Connection:
         self.home.mkdir(parents=True, exist_ok=True)
@@ -131,6 +136,29 @@ class Store:
             conn.executescript(SCHEMA)
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('next_fence', '1')"
+            )
+            self._migrate_service_probe_columns(conn)
+
+    def _migrate_service_probe_columns(self, conn: sqlite3.Connection) -> None:
+        """Upgrade pre-digest-probe databases and backfill content fingerprints."""
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+        additions = {
+            "actual_content_hash": "TEXT",
+            "last_probe_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "last_probe_changed": "INTEGER",
+        }
+        for column, decl in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE services ADD COLUMN {column} {decl}")
+        rows = conn.execute(
+            "SELECT name, actual_content FROM services "
+            "WHERE actual_content IS NOT NULL AND actual_content_hash IS NULL"
+        ).fetchall()
+        for row in rows:
+            digest = content_hash(json.loads(row["actual_content"]))
+            conn.execute(
+                "UPDATE services SET actual_content_hash=? WHERE name=?",
+                (digest, row["name"]),
             )
 
     def initialize_home(
@@ -221,8 +249,8 @@ class Store:
                     INSERT INTO services(
                       name, group_name, base_url, state_path,
                       initial_version, initial_content,
-                      actual_version, actual_content, actual_fence
-                    ) VALUES(?,?,?,?,?,?,?,?,0)
+                      actual_version, actual_content, actual_content_hash, actual_fence
+                    ) VALUES(?,?,?,?,?,?,?,?,?,0)
                     ON CONFLICT(name) DO UPDATE SET
                       group_name=excluded.group_name,
                       base_url=excluded.base_url,
@@ -239,9 +267,16 @@ class Store:
                         canonical_json(content),
                         version,
                         canonical_json(content),
+                        content_hash(content),
                     ),
                 )
         return cluster
+
+    def append_probe_round(self, entry: dict[str, Any]) -> None:
+        """Append one background probe round's per-service byte accounting."""
+        line = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+        with self.probe_traffic_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
     def load_cluster(self) -> dict[str, Any]:
         if not self.cluster_path.exists():

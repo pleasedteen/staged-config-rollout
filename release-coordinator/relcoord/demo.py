@@ -455,6 +455,32 @@ class FaultDemo:
             self.check("status shows live effective version/content", "version=v3.0.0-canary" in status_text and "speculative_retry" in status_text)
             self.check("status does not render null live config", "version=None" not in status_text)
 
+            self.step("Background probes stay compact while effective state is unchanged")
+            traffic_path = self.store.probe_traffic_path
+            self.wait_until("probe traffic log exists", traffic_path.exists, timeout=8)
+            rounds = [
+                json.loads(line)
+                for line in traffic_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            steady = [
+                item
+                for entry in rounds
+                for item in entry["services"].values()
+                if item.get("ok") and item["changed"] is False
+            ]
+            self.check("probe traffic rounds were recorded", len(rounds) >= 3, f"({len(rounds)} rounds)")
+            self.check(
+                "every unchanged probe body <= 2 KiB even with full-content configs",
+                all(item["response_bytes"] <= 2048 for item in steady),
+                f"(max={max((i['response_bytes'] for i in steady), default=0)} B)",
+            )
+            largest = max(rounds, key=lambda r: r["total_response_bytes"])
+            self.info(
+                f"largest probe round totaled {largest['total_response_bytes']} B "
+                f"across {len(self.initial)} services (log: {traffic_path.name})"
+            )
+
             self.step("Stop svc-5, then resume; reachable svc-4 proceeds but svc-5 blocks later batches")
             self.stop_service("svc-5")
             self.run_cli("resume")
