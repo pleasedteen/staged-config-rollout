@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -130,6 +132,92 @@ class MockServiceFenceTests(unittest.TestCase):
             self.assertEqual(ctx.exception.status, 409)
             self.assertEqual(ctx.exception.code, "stale_fence")
             self.assertEqual(service.public_state()["effective"]["version"], "v1")
+
+
+class RollbackDuringSuspendedPublishTests(unittest.TestCase):
+    """A suspended publish must not block the rollback that undoes it."""
+
+    def _service(self, td: str) -> MockService:
+        return MockService(
+            "svc-x",
+            Path(td) / "svc-x.json",
+            {"svc-x": {"version": "v1", "content": {"k": 1}}},
+        )
+
+    def test_rollback_applies_while_publish_is_delayed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(td)
+            service.update_faults({"delay_seconds": 1.0, "delay_next": 1})
+            publish = {
+                "command_id": "apply-rel-x-svc-x",
+                "fence": 1,
+                "release_id": "rel-x",
+                "mode": "publish",
+                "version": "v2",
+                "content": {"k": 2},
+            }
+            rollback = {
+                "command_id": "rollback-rel-x-svc-x",
+                "fence": 2,
+                "release_id": "rel-x",
+                "mode": "rollback",
+                "version": "v1",
+                "content": {"k": 1},
+            }
+
+            result: dict[str, object] = {}
+
+            def do_publish() -> None:
+                try:
+                    result["publish"] = service.apply(dict(publish))
+                except ServiceAPIError as e:
+                    result["publish"] = e
+
+            thread = threading.Thread(target=do_publish)
+            thread.start()
+            # Wait until the publish is provably sleeping in the injected delay.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not service.public_state()["inflight"]:
+                time.sleep(0.005)
+            self.assertTrue(service.public_state()["inflight"], "publish never entered the delay")
+
+            start = time.monotonic()
+            service.apply(dict(rollback))
+            elapsed = time.monotonic() - start
+
+            self.assertLess(elapsed, 0.5, f"rollback queued behind suspended publish ({elapsed:.2f}s)")
+            self.assertEqual(service.public_state()["effective"]["version"], "v1")
+
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            # The late publish wakes up after the rollback fence; it is refused
+            # and the restored config is unchanged.
+            publish_result = result.get("publish")
+            self.assertIsInstance(publish_result, ServiceAPIError)
+            self.assertEqual(publish_result.code, "stale_fence")
+            state = service.public_state()
+            self.assertEqual(state["effective"], {"version": "v1", "content": {"k": 1}})
+            self.assertEqual(state["fence"], 2)
+
+    def test_rollback_mode_is_not_delayed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(td)
+            service.update_faults({"delay_seconds": 1.0, "delay_next": 1})
+            start = time.monotonic()
+            service.apply(
+                {
+                    "command_id": "rollback-rel-x-svc-x",
+                    "fence": 2,
+                    "release_id": "rel-x",
+                    "mode": "rollback",
+                    "version": "v1",
+                    "content": {"k": 1},
+                }
+            )
+            self.assertLess(time.monotonic() - start, 0.5)
+            # The rollback did not consume the publish delay budget.
+            self.assertEqual(service.public_state()["faults"]["delay_remaining"], 1)
+
 
 
 if __name__ == "__main__":

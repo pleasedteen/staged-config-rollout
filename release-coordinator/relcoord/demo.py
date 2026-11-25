@@ -39,15 +39,15 @@ def tail(path: Path, max_chars: int = 6000) -> str:
         return f"(no log {path})"
 
 
-class FaultDemo:
-    def __init__(self, *, keep_processes: bool = False):
+class DemoHarness:
+    """Shared process/SQLite orchestration for self-checking demo scenarios."""
+
+    def __init__(self, *, keep_processes: bool = False, service_count: int = 6):
         self.keep_processes = keep_processes
         self.home = Path(tempfile.mkdtemp(prefix="relcoord-demo-"))
-        self.ports = free_tcp_ports(6)
+        self.ports = free_tcp_ports(service_count)
         self.store = Store(self.home)
         self.initial = load_initial_state()["services"]
-        fault_path = PROJECT_ROOT / "faults" / "demo-faults.json"
-        self.fault_data = json.loads(fault_path.read_text(encoding="utf-8"))
         self.service_procs: dict[str, subprocess.Popen] = {}
         self.coordinator_proc: subprocess.Popen | None = None
         self.passed_checks: list[str] = []
@@ -250,6 +250,13 @@ class FaultDemo:
         for name in ("svc-2", "svc-3", "svc-5"):
             print(f"\n--- {name} log tail ---", file=sys.stderr)
             print(tail(self.home / "logs" / f"{name}.log", 2500), file=sys.stderr)
+
+
+class FaultDemo(DemoHarness):
+    def __init__(self, *, keep_processes: bool = False):
+        super().__init__(keep_processes=keep_processes, service_count=6)
+        fault_path = PROJECT_ROOT / "faults" / "demo-faults.json"
+        self.fault_data = json.loads(fault_path.read_text(encoding="utf-8"))
 
     def run(self) -> int:
         started_at = time.monotonic()
@@ -552,10 +559,225 @@ class FaultDemo:
             self.cleanup()
 
 
+class HangRollbackDemo(DemoHarness):
+    """Focused check: a rollback must not wait behind the publish it undoes.
+
+    Batch 1's publishes are suspended 5s by local fault injection. While their
+    requests are still outstanding, we accept rollback and require every
+    already-started service to confirm its own baseline within 800ms.
+    """
+
+    HANG_SECONDS = 5.0
+    RECOVERY_BUDGET_MS = 800.0
+
+    def __init__(self, *, keep_processes: bool = False):
+        super().__init__(keep_processes=keep_processes, service_count=6)
+        self.suspended = ["svc-1", "svc-2"]
+
+    def _set_hang(self, name: str) -> None:
+        self.run_cli(
+            "faults",
+            "--service",
+            name,
+            "--set",
+            json.dumps({"delay_seconds": self.HANG_SECONDS, "delay_next": 1}),
+        )
+
+    def _publish_request_pending(self, name: str, release_id: str) -> bool:
+        state = self.live_state(name)
+        return any(
+            item.get("mode") == "publish"
+            and item.get("command_id") == f"apply-{release_id}-{name}"
+            for item in state.get("inflight", [])
+        )
+
+    def run(self) -> int:
+        started_at = time.monotonic()
+        try:
+            self.banner("Rollback while current-batch publishes are suspended")
+            print(f"runtime home: {self.home}")
+            self.run_cli("init", "--ports", ",".join(map(str, self.ports)))
+            for name in self.initial:
+                self.start_service(name)
+            self.start_coordinator()
+            self.wait_until(
+                "coordinator observes all services reachable",
+                lambda: all(r["reachable"] for r in self.store.list_services()),
+                timeout=8,
+            )
+
+            self.step(f"Inject a {self.HANG_SECONDS:.0f}s delay on the first publish to {self.suspended}")
+            for name in self.suspended:
+                self._set_hang(name)
+            for name in self.suspended:
+                faults = self.live_state(name)["faults"]
+                self.info(f"{name} faults: {json.dumps(faults, sort_keys=True)}")
+
+            v2 = str(PROJECT_ROOT / "configs" / "target-v2.json")
+            self.step("Submit v2: batch 1 (svc-1, svc-2), then batch 2 (svc-3, svc-4), batch 3 (svc-5, svc-6)")
+            submit = self.run_cli(
+                "submit", v2,
+                "--batch", "svc-1,svc-2",
+                "--batch", "svc-3,svc-4",
+                "--batch", "svc-5,svc-6",
+            )
+            rid = submit.stdout.split("submitted release ", 1)[1].splitlines()[0].strip()
+            self.info(f"release {rid}")
+
+            self.step("Wait until both batch-1 publishes are physically on the wire")
+            def both_suspended() -> bool:
+                return all(self._publish_request_pending(n, rid) for n in self.suspended)
+
+            self.wait_until("svc-1/svc-2 publish requests are pending", both_suspended, timeout=5)
+            pending_started = self.store.get_release(rid)["created_at"]
+            inflight = {n: self.live_state(n).get("inflight", []) for n in self.suspended}
+            for n, items in inflight.items():
+                self.info(f"{n} in-flight request: {json.dumps(items, sort_keys=True)}")
+            self.check(
+                "old publish requests genuinely outstanding at rollback time",
+                all(items for items in inflight.values()),
+            )
+            self.check(
+                "no service has confirmed the target yet",
+                all(not self.release_row_service(rid, n)["applied_confirmed"] for n in self.suspended),
+            )
+            self.check(
+                "later batches have not started",
+                not self.release_row_service(rid, "svc-3")["started"]
+                and not self.release_row_service(rid, "svc-6")["started"],
+            )
+
+            self.step("Accept rollback while the 5s publish delay is still running")
+            accepted = self.run_cli("rollback", "--reason", "reproduce rollback-behind-hang")
+            self.info(accepted.stdout.strip())
+            rollback_t0 = time.monotonic()
+
+            def started_services_restored() -> bool:
+                return all(
+                    self.release_row_service(rid, n)["rollback_confirmed"]
+                    for n in ("svc-1", "svc-2")
+                )
+
+            self.wait_until(
+                f"batch-1 services confirm their baselines within {self.RECOVERY_BUDGET_MS:.0f}ms",
+                started_services_restored,
+                timeout=self.RECOVERY_BUDGET_MS / 1000.0,
+                interval=0.02,
+            )
+            recovery_ms = (time.monotonic() - rollback_t0) * 1000.0
+            self.info(f"batch-1 rollback confirmed in {recovery_ms:.0f}ms")
+            self.check(
+                f"rollback confirms within {self.RECOVERY_BUDGET_MS:.0f}ms",
+                recovery_ms <= self.RECOVERY_BUDGET_MS,
+                f"(took {recovery_ms:.0f}ms)",
+            )
+            for name in self.suspended:
+                state = self.live_state(name)
+                self.check(
+                    f"{name} live config is its own baseline {self.initial[name]['version']}",
+                    self.matches_initial(name, state),
+                )
+            still_pending = {n: self.live_state(n).get("inflight", []) for n in self.suspended}
+            self.info(f"in-flight after rollback: {json.dumps({k: [i['command_id'] for i in v] for k, v in still_pending.items()})}")
+            self.check(
+                "old publish requests are still waiting when rollback confirms",
+                any(still_pending.values()),
+            )
+
+            unstarted = ["svc-3", "svc-4", "svc-5", "svc-6"]
+            self.check(
+                "unstarted batches were never touched",
+                all(
+                    not self.release_row_service(rid, n)["started"]
+                    and self.live_state(n)["effective"]["version"] == self.initial[n]["version"]
+                    for n in unstarted
+                ),
+            )
+
+            self.step("Once the suspended publishes wake, they must not overwrite restored config")
+            deadline = time.monotonic() + self.HANG_SECONDS + 4
+            while time.monotonic() < deadline:
+                if not any(self.live_state(n).get("inflight") for n in self.suspended):
+                    break
+                time.sleep(0.05)
+            time.sleep(0.4)
+            for name in self.suspended:
+                state = self.live_state(name)
+                outcomes = [r.get("outcome") for r in state.get("recent_requests", [])]
+                self.info(f"{name} outcomes: {outcomes[-4:]}")
+                self.check(
+                    f"late publish on {name} fenced off",
+                    "rejected_stale_fence" in outcomes,
+                )
+                self.check(
+                    f"{name} still serves baseline content after late publish",
+                    self.matches_initial(name, state),
+                )
+
+            self.wait_until(
+                "rollback completes",
+                lambda: self.store.get_release(rid)["status"] == "rolled_back",
+                timeout=8,
+            )
+            self.check(
+                "only started batch 1 was restored; release rolled back",
+                self.store.get_release(rid)["status"] == "rolled_back",
+            )
+
+            self.step("Restart a restored service; the late publish cannot return either")
+            self.stop_service("svc-1")
+            self.start_service("svc-1")
+            restarted = self.live_state("svc-1")
+            self.check("restarted svc-1 still serves baseline", self.matches_initial("svc-1", restarted))
+            try:
+                client.apply_config(
+                    self.url("svc-1"),
+                    command_id=f"apply-{rid}-svc-1",
+                    fence=int(self.store.get_release(rid)["apply_fence"]),
+                    release_id=rid,
+                    mode="publish",
+                    version="v2.0.0",
+                    content=json.loads((PROJECT_ROOT / "configs" / "target-v2.json").read_text())["content"],
+                    timeout=2,
+                )
+                raise AssertionError("late publish accepted after restart")
+            except client.ServiceRejected as e:
+                self.check(
+                    "restarted svc-1 rejects the old publish with stale_fence",
+                    e.code == "stale_fence",
+                )
+            self.check(
+                "restarted svc-1 config unchanged",
+                self.matches_initial("svc-1", self.live_state("svc-1")),
+            )
+
+            elapsed = time.monotonic() - started_at
+            self.banner(f"ROLLBACK-WHILE-HUNG PASSED in {elapsed:.1f}s — {len(self.passed_checks)} checks")
+            print(f"state/logs retained at: {self.home}")
+            return 0
+        except Exception as e:
+            self.banner("ROLLBACK-WHILE-HUNG FAILED")
+            print(f"{type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc()
+            self.show_failure_logs()
+            print(f"\nDemo home retained for inspection: {self.home}", file=sys.stderr)
+            return 1
+        finally:
+            self.cleanup()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run self-checking local fault demo")
     parser.add_argument("--keep-processes", action="store_true", help="leave demo services/coordinator running")
+    parser.add_argument(
+        "--scenario",
+        choices=("full", "rollback-while-hung"),
+        default="full",
+        help="full: original end-to-end fault demo; rollback-while-hung: focused reproduction",
+    )
     args = parser.parse_args(argv)
+    if args.scenario == "rollback-while-hung":
+        return HangRollbackDemo(keep_processes=args.keep_processes).run()
     return FaultDemo(keep_processes=args.keep_processes).run()
 
 

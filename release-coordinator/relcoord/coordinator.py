@@ -6,7 +6,7 @@ import json
 import os
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,20 @@ class Coordinator:
         self.store = Store(self.home)
         self.interval = interval
         self.cluster = self.store.load_cluster()
-        self.pool = ThreadPoolExecutor(max_workers=max(8, len(self.cluster["services"]) + 2))
+        # Probing must never share workers with apply/rollback: a suspended
+        # publish would otherwise starve the very rollback that unblocks it.
+        workers = max(8, len(self.cluster["services"]) + 2)
+        self.probe_pool = ThreadPoolExecutor(max_workers=workers)
+        # One worker per service per direction (publish + rollback) so rollback
+        # requests are dispatched even while publish requests are still pending.
+        self.action_pool = ThreadPoolExecutor(max_workers=max(8, len(self.cluster["services"]) * 2 + 2))
+        self.apply_inflight: dict[str, Future] = {}
+        self.rollback_inflight: dict[str, Future] = {}
+        self.probe_inflight: dict[str, tuple[Future, float]] = {}
+        # Which release the in-flight apply/rollback futures belong to. Futures
+        # are only reused within the same release; a new release starts clean.
+        self._apply_release_id: str | None = None
+        self._rollback_release_id: str | None = None
         self._lock_fd: Any | None = None
 
     def acquire_singleton(self) -> None:
@@ -40,7 +53,8 @@ class Coordinator:
         (self.home / "coordinator.pid").write_text(str(os.getpid()), encoding="utf-8")
 
     def close(self) -> None:
-        self.pool.shutdown(wait=False, cancel_futures=True)
+        for pool in (self.action_pool, self.probe_pool):
+            pool.shutdown(wait=False, cancel_futures=True)
         if self._lock_fd is not None:
             try:
                 fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
@@ -50,12 +64,33 @@ class Coordinator:
 
     def probe_services(self) -> None:
         services = self.store.list_services()
-        future_map = {
-            self.pool.submit(client.fetch_state, row["base_url"], 0.65): row
-            for row in services
-        }
+        by_name = {row["name"]: row for row in services}
+        # Drop probes for services that no longer exist.
+        for name in list(self.probe_inflight):
+            if name not in by_name:
+                self.probe_inflight.pop(name, None)
+        # Any apply/rollback that completes after its probe started was
+        # confirmed by the response itself; the older probe must not overwrite it.
+        barrier = now_ts()
+
+        # Non-blocking probing: each service keeps at most one probe on the wire.
+        # A slow/unreachable service can therefore never stall the reconcile
+        # tick that dispatches a rollback.
+        for row in services:
+            if row["name"] not in self.probe_inflight:
+                self.probe_inflight[row["name"]] = (
+                    self.probe_pool.submit(client.fetch_state, row["base_url"], 0.65),
+                    barrier,
+                )
+
         updates: list[tuple[Any, ...]] = []
-        for future, row in future_map.items():
+        for name in list(self.probe_inflight):
+            future, started_at = self.probe_inflight[name]
+            if not future.done():
+                continue
+            row = by_name.get(name)
+            if row is None:
+                continue
             try:
                 state = future.result()
                 effective = state.get("effective") or {}
@@ -66,37 +101,44 @@ class Coordinator:
                         effective.get("version"),
                         canonical_json(content) if content is not None else None,
                         int(state.get("fence", row["actual_fence"] or 0)),
+                        started_at,
                         now_ts(),
                         None,
                         row["name"],
                     )
                 )
             except Exception as e:
-                updates.append((0, None, None, None, now_ts(), str(e)[:300], row["name"]))
+                updates.append(
+                    (0, None, None, None, started_at, now_ts(), str(e)[:300], row["name"])
+                )
+            del self.probe_inflight[name]
 
         if not updates:
             return
         with self.store.connect() as conn:
-            for reachable, version, content, fence, ts, error, name in updates:
+            for reachable, version, content, fence, started_at, ts, error, name in updates:
                 if reachable:
+                    # A probe that finished after an apply/rollback confirmation
+                    # landed must not regress the ledger with its older view.
                     conn.execute(
                         """
                         UPDATE services
                         SET reachable=1, actual_version=?, actual_content=?,
                             actual_fence=?, last_checked=?, last_error=NULL
-                        WHERE name=?
+                        WHERE name=? AND (last_checked IS NULL OR last_checked <= ?)
                         """,
-                        (version, content, fence, ts, name),
+                        (version, content, fence, ts, name, started_at),
                     )
                 else:
                     conn.execute(
                         """
                         UPDATE services
                         SET reachable=0, last_checked=?, last_error=?
-                        WHERE name=?
+                        WHERE name=? AND (last_checked IS NULL OR last_checked <= ?)
                         """,
-                        (ts, error, name),
+                        (ts, error, name, started_at),
                     )
+            conn.commit()
 
     def _apply_one(
         self,
@@ -136,7 +178,22 @@ class Coordinator:
         except Exception as e:
             return {"ok": False, "error": "unreachable_or_timeout", "detail": str(e)[:300]}
 
+    def _submit_apply(self, rs: Any, svc: Any, release: Any, target_content: dict[str, Any]) -> None:
+        self.apply_inflight[rs["service_name"]] = self.action_pool.submit(
+            self._apply_one,
+            svc,
+            rs,
+            command_id=rs["apply_command_id"],
+            fence=int(release["apply_fence"]),
+            mode="publish",
+            version=release["target_version"],
+            content=target_content,
+        )
+
     def reconcile_apply(self, release: Any) -> None:
+        if self._apply_release_id != release["id"]:
+            self.apply_inflight.clear()
+            self._apply_release_id = release["id"]
         rows = self.store.release_services(release["id"])
         pending = [r for r in rows if r["started"] and not r["applied_confirmed"]]
         if not pending:
@@ -145,81 +202,83 @@ class Coordinator:
 
         target_content = json.loads(release["target_content"])
         services = {s["name"]: s for s in self.store.list_services()}
-        futures = {}
+        pending_names = {rs["service_name"] for rs in pending}
+        # A pending publish from an earlier tick is still on the wire (typically
+        # under an injected delay); keep it instead of piling up duplicate sends.
+        # This does not block the tick: a rollback accepted meanwhile is
+        # reconciled on its own path.
+        for name in list(self.apply_inflight):
+            if name not in pending_names:
+                self.apply_inflight.pop(name, None)
         for rs in pending:
-            svc = services[rs["service_name"]]
-            futures[
-                self.pool.submit(
-                    self._apply_one,
-                    svc,
-                    rs,
-                    command_id=rs["apply_command_id"],
-                    fence=int(release["apply_fence"]),
-                    mode="publish",
-                    version=release["target_version"],
-                    content=target_content,
-                )
-            ] = rs
+            if rs["service_name"] not in self.apply_inflight:
+                self._submit_apply(rs, services[rs["service_name"]], release, target_content)
 
         results: dict[str, dict[str, Any]] = {}
-        for future in futures:
-            rs = futures[future]
+        for name in list(pending_names):
+            future = self.apply_inflight.get(name)
+            if future is None or not future.done():
+                continue
             try:
-                results[rs["service_name"]] = future.result()
+                results[name] = future.result()
             except Exception as e:
-                results[rs["service_name"]] = {
+                results[name] = {
                     "ok": False,
                     "error": "coordinator_task_error",
                     "detail": str(e)[:300],
                 }
+            del self.apply_inflight[name]
 
-        with self.store.connect() as conn:
-            for rs in pending:
-                result = results[rs["service_name"]]
-                if result["ok"]:
-                    eff = result["effective"]
-                    conn.execute(
-                        """
-                        UPDATE release_services
-                        SET applied_confirmed=1, apply_attempts=apply_attempts+1, last_error=''
-                        WHERE release_id=? AND service_name=?
-                        """,
-                        (release["id"], rs["service_name"]),
-                    )
-                    conn.execute(
-                        """
-                        UPDATE services
-                        SET reachable=1, actual_version=?, actual_content=?, last_checked=?, last_error=NULL
-                        WHERE name=?
-                        """,
-                        (
-                            eff.get("version"),
-                            canonical_json(eff.get("content")),
-                            now_ts(),
-                            rs["service_name"],
-                        ),
-                    )
-                    self.store.add_event(
-                        conn,
-                        release["id"],
-                        "service_confirmed",
-                        f"{rs['service_name']} confirmed {release['target_version']}",
-                    )
-                else:
-                    detail = f"{result.get('error')}: {result.get('detail', '')}"[:300]
-                    conn.execute(
-                        """
-                        UPDATE release_services
-                        SET apply_attempts=apply_attempts+1, last_error=?
-                        WHERE release_id=? AND service_name=?
-                        """,
-                        (detail, release["id"], rs["service_name"]),
-                    )
-                    conn.execute(
-                        "UPDATE services SET reachable=0, last_error=?, last_checked=? WHERE name=?",
-                        (detail, now_ts(), rs["service_name"]),
-                    )
-            conn.commit()
+        if results:
+            with self.store.connect() as conn:
+                for rs in pending:
+                    result = results.get(rs["service_name"])
+                    if result is None:
+                        continue
+                    if result["ok"]:
+                        eff = result["effective"]
+                        conn.execute(
+                            """
+                            UPDATE release_services
+                            SET applied_confirmed=1, apply_attempts=apply_attempts+1, last_error=''
+                            WHERE release_id=? AND service_name=?
+                            """,
+                            (release["id"], rs["service_name"]),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE services
+                            SET reachable=1, actual_version=?, actual_content=?, last_checked=?, last_error=NULL
+                            WHERE name=?
+                            """,
+                            (
+                                eff.get("version"),
+                                canonical_json(eff.get("content")),
+                                now_ts(),
+                                rs["service_name"],
+                            ),
+                        )
+                        self.store.add_event(
+                            conn,
+                            release["id"],
+                            "service_confirmed",
+                            f"{rs['service_name']} confirmed {release['target_version']}",
+                        )
+                    else:
+                        detail = f"{result.get('error')}: {result.get('detail', '')}"[:300]
+                        conn.execute(
+                            """
+                            UPDATE release_services
+                            SET apply_attempts=apply_attempts+1, last_error=?
+                            WHERE release_id=? AND service_name=?
+                            """,
+                            (detail, release["id"], rs["service_name"]),
+                        )
+                        conn.execute(
+                            "UPDATE services SET reachable=0, last_error=?, last_checked=? WHERE name=?",
+                            (detail, now_ts(), rs["service_name"]),
+                        )
+                conn.commit()
 
         self.advance_if_complete(release["id"])
 
@@ -294,6 +353,9 @@ class Coordinator:
                 raise
 
     def reconcile_rollback(self, release: Any) -> None:
+        if self._rollback_release_id != release["id"]:
+            self.rollback_inflight.clear()
+            self._rollback_release_id = release["id"]
         rows = self.store.release_services(release["id"])
         pending = [r for r in rows if r["started"] and not r["rollback_confirmed"]]
 
@@ -310,84 +372,93 @@ class Coordinator:
 
         if pending:
             services = {s["name"]: s for s in self.store.list_services()}
-            futures = {}
             fence = release["rollback_fence"]
             if fence is None:
                 raise RuntimeError(f"release {release['id']} has no rollback fence")
+            pending_names = {rs["service_name"] for rs in pending}
+            for name in list(self.rollback_inflight):
+                if name not in pending_names:
+                    self.rollback_inflight.pop(name, None)
             for rs in pending:
+                if rs["service_name"] in self.rollback_inflight:
+                    continue
                 baseline_content = json.loads(rs["baseline_content"])
-                futures[
-                    self.pool.submit(
-                        self._apply_one,
-                        services[rs["service_name"]],
-                        rs,
-                        command_id=rs["rollback_command_id"],
-                        fence=int(fence),
-                        mode="rollback",
-                        version=rs["baseline_version"],
-                        content=baseline_content,
-                    )
-                ] = rs
+                self.rollback_inflight[rs["service_name"]] = self.action_pool.submit(
+                    self._apply_one,
+                    services[rs["service_name"]],
+                    rs,
+                    command_id=rs["rollback_command_id"],
+                    fence=int(fence),
+                    mode="rollback",
+                    version=rs["baseline_version"],
+                    content=baseline_content,
+                )
 
             results: dict[str, dict[str, Any]] = {}
-            for future in futures:
-                rs = futures[future]
+            for name in list(pending_names):
+                future = self.rollback_inflight.get(name)
+                if future is None or not future.done():
+                    continue
                 try:
-                    results[rs["service_name"]] = future.result()
+                    results[name] = future.result()
                 except Exception as e:
-                    results[rs["service_name"]] = {
+                    results[name] = {
                         "ok": False,
                         "error": "coordinator_task_error",
                         "detail": str(e)[:300],
                     }
+                del self.rollback_inflight[name]
 
-            with self.store.connect() as conn:
-                for rs in pending:
-                    result = results[rs["service_name"]]
-                    if result["ok"]:
-                        eff = result["effective"]
-                        conn.execute(
-                            """
-                            UPDATE release_services
-                            SET rollback_confirmed=1, rollback_attempts=rollback_attempts+1, last_error=''
-                            WHERE release_id=? AND service_name=?
-                            """,
-                            (release["id"], rs["service_name"]),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE services
-                            SET reachable=1, actual_version=?, actual_content=?, last_checked=?, last_error=NULL
-                            WHERE name=?
-                            """,
-                            (
-                                eff.get("version"),
-                                canonical_json(eff.get("content")),
-                                now_ts(),
-                                rs["service_name"],
-                            ),
-                        )
-                        self.store.add_event(
-                            conn,
-                            release["id"],
-                            "rollback_service_confirmed",
-                            f"{rs['service_name']} restored to {rs['baseline_version']}",
-                        )
-                    else:
-                        detail = f"{result.get('error')}: {result.get('detail', '')}"[:300]
-                        conn.execute(
-                            """
-                            UPDATE release_services
-                            SET rollback_attempts=rollback_attempts+1, last_error=?
-                            WHERE release_id=? AND service_name=?
-                            """,
-                            (detail, release["id"], rs["service_name"]),
-                        )
-                        conn.execute(
-                            "UPDATE services SET reachable=0, last_error=?, last_checked=? WHERE name=?",
-                            (detail, now_ts(), rs["service_name"]),
-                        )
-                conn.commit()
+            if results:
+                with self.store.connect() as conn:
+                    for rs in pending:
+                        result = results.get(rs["service_name"])
+                        if result is None:
+                            continue
+                        if result["ok"]:
+                            eff = result["effective"]
+                            conn.execute(
+                                """
+                                UPDATE release_services
+                                SET rollback_confirmed=1, rollback_attempts=rollback_attempts+1, last_error=''
+                                WHERE release_id=? AND service_name=?
+                                """,
+                                (release["id"], rs["service_name"]),
+                            )
+                            conn.execute(
+                                """
+                                UPDATE services
+                                SET reachable=1, actual_version=?, actual_content=?, last_checked=?, last_error=NULL
+                                WHERE name=?
+                                """,
+                                (
+                                    eff.get("version"),
+                                    canonical_json(eff.get("content")),
+                                    now_ts(),
+                                    rs["service_name"],
+                                ),
+                            )
+                            self.store.add_event(
+                                conn,
+                                release["id"],
+                                "rollback_service_confirmed",
+                                f"{rs['service_name']} restored to {rs['baseline_version']}",
+                            )
+                        else:
+                            detail = f"{result.get('error')}: {result.get('detail', '')}"[:300]
+                            conn.execute(
+                                """
+                                UPDATE release_services
+                                SET rollback_attempts=rollback_attempts+1, last_error=?
+                                WHERE release_id=? AND service_name=?
+                                """,
+                                (detail, release["id"], rs["service_name"]),
+                            )
+                            conn.execute(
+                                "UPDATE services SET reachable=0, last_error=?, last_checked=? WHERE name=?",
+                                (detail, now_ts(), rs["service_name"]),
+                            )
+                    conn.commit()
 
         self.complete_rollback_if_done(release["id"])
 

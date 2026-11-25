@@ -31,6 +31,9 @@ class MockService:
         self.name = name
         self.state_path = Path(state_path)
         self.lock = threading.RLock()
+        # Requests currently sleeping in the injected delay, keyed by command id.
+        # Process-local on purpose: a hard restart drops the wait, not the state.
+        self.inflight: dict[str, dict[str, Any]] = {}
         if self.state_path.exists():
             with self.state_path.open("r", encoding="utf-8") as f:
                 self.state = json.load(f)
@@ -74,7 +77,9 @@ class MockService:
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
-            return json.loads(json.dumps(self.state))
+            body = json.loads(json.dumps(self.state))
+            body["inflight"] = [dict(v) for v in self.inflight.values()]
+            return body
 
     def update_faults(self, patch: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -133,14 +138,47 @@ class MockService:
         reqs.append(item)
         del reqs[:-30]
 
-    def _delay_if_configured_locked(self) -> None:
-        faults = self.state["faults"]
-        if faults.get("delay_remaining", 0) > 0 and faults.get("delay_seconds", 0) > 0:
-            seconds = float(faults["delay_seconds"])
-            faults["delay_remaining"] = int(faults["delay_remaining"]) - 1
-            self._record_locked("delayed", None, {"sleep_seconds": seconds})
-            self._save_locked()
-            time.sleep(seconds)
+    def _delay_if_configured(self, payload: dict[str, Any], request_fence: int) -> None:
+        """Sleep outside the state lock so a rollback can be served while this
+        publish request is still pending.
+
+        Only ``publish`` instructions are throttled: a rollback must never queue
+        behind the very publish it is meant to undo. Already-stale instructions
+        are not delayed either, so a late publish is refused immediately.
+        """
+        if payload.get("mode") != "publish":
+            return
+        seconds = 0.0
+        with self.lock:
+            faults = self.state.setdefault("faults", {})
+            faults.setdefault("delay_seconds", 0.0)
+            faults.setdefault("delay_remaining", 0)
+            if request_fence < int(self.state.get("fence", 0)):
+                return
+            if float(faults.get("delay_seconds", 0.0)) > 0 and int(
+                faults.get("delay_remaining", 0)
+            ) > 0:
+                seconds = float(faults["delay_seconds"])
+                faults["delay_remaining"] = int(faults["delay_remaining"]) - 1
+                self._record_locked("delayed", payload, {"sleep_seconds": seconds})
+                self._save_locked()
+        if seconds > 0:
+            # No lock is held here: a higher-fence rollback may be applied while
+            # this old publish is still waiting.
+            command_id = str(payload.get("command_id"))
+            with self.lock:
+                self.inflight[command_id] = {
+                    "command_id": command_id,
+                    "mode": payload.get("mode"),
+                    "version": payload.get("version"),
+                    "fence": request_fence,
+                    "started_at": now_ts(),
+                }
+            try:
+                time.sleep(seconds)
+            finally:
+                with self.lock:
+                    self.inflight.pop(command_id, None)
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         required = ("command_id", "fence", "release_id", "mode", "version", "content")
@@ -155,8 +193,11 @@ class MockService:
         if not isinstance(content, dict):
             raise ServiceAPIError(400, "invalid_request", "content must be an object")
 
+        # Injection delay runs without the state lock, then the whole compare/
+        # apply stays atomic under it.
+        self._delay_if_configured(payload, request_fence)
+
         with self.lock:
-            self._delay_if_configured_locked()
             current_fence = int(self.state.get("fence", 0))
 
             # A confirmed rollback has a larger fence. A delayed old publish is

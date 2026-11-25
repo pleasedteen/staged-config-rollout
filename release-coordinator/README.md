@@ -31,6 +31,26 @@
 python3 -m unittest discover -s tests -v
 ```
 
+### 复现「发布卡住时回退跟着等」
+
+一条命令复现：当前批的发布被本地故障注入挂起 5 秒，期间接受回退，已开始批次的服务应在 800ms 内逐台确认恢复，而它们各自的旧发布请求此刻仍在等待。
+
+```bash
+python3 -m relcoord.demo --scenario rollback-while-hung
+# 或 ./run_demo.sh --scenario rollback-while-hung
+```
+
+它验证：
+
+- 注入 `delay_seconds=5, delay_next=1` 后，svc-1/svc-2 的第一条 publish 请求确实挂在服务端在途（`/state` 的 `inflight` 可见）。
+- 回退接受后 800ms 内 svc-1/svc-2 逐台确认恢复各自的 baseline（通常约 120–170ms）。
+- 回退确认时旧 publish 仍在 `inflight`，说明没有被回退“等到”。
+- 旧 publish 苏醒后因更低 fence 被 `409 stale_fence` 拒绝，内容不变。
+- 未开始批次（svc-3..svc-6）不动。
+- 重启 svc-1 后仍提供 baseline，迟到的旧发布依旧被拒绝。
+
+实现保证：故障注入的延迟在服务状态锁之外执行，且只作用于 `publish`（回退不节流）；协调器把探针与发布/回退放在不同线程池，tick 只做非阻塞的在途追踪，因此一批发布被挂起不会阻塞回退派发，也保留正常的发布超时（超时后退避重试）、逐服务基线与未开始批次规则。
+
 ## 手动启动
 
 ```bash
@@ -155,7 +175,7 @@ kill -9 "$(cat runtime/pids/coordinator.pid)"
 
 - `drop_apply: N`：前 N 次 apply 不写入，返回注入错误；协调器重试。
 - `lose_receipt: N`：前 N 次 apply 已持久化，但不返回 HTTP 响应；协调器用同一 command ID 重试。
-- `delay_next: N` + `delay_seconds: S`：前 N 次请求延迟 S 秒。
+- `delay_next: N` + `delay_seconds: S`：前 N 次 `publish` 请求延迟 S 秒；延迟在状态锁之外执行，回退请求不会被它阻塞，也不会消耗延迟次数。
 - 直接停止服务进程可模拟真正失联。
 
 直接查询服务实际状态：
@@ -186,6 +206,7 @@ curl -s http://127.0.0.1:9301/state | python3 -m json.tool
 - **fence 防迟到写**：提交发布分配 apply fence；接受回退分配更大的 rollback fence。服务持久化已见最大 fence，回退确认后更低的旧发布指令返回 `409 stale_fence`。
 - **baseline**：提交发布时从 SQLite 最后实际状态（初始化时来自 `data/initial-state.json`）保存每服务自己的版本和内容。
 - **并发批次调用**：同一批服务并发下发，避免一个失联服务的网络超时阻塞同批其他服务。
+- **不阻塞 tick**：探针与发布/回退使用独立线程池；协调器每个 tick 只检查在途 future，不 `future.result()` 阻塞。发布被挂起时回退仍能派发并确认；发布请求仍在正常超时内，超时后按同一 command ID 重试。
 
 ## 目录
 
