@@ -1,0 +1,13 @@
+{
+  "version": "v2.0.0",
+  "content": {
+    "release_channel": "stable",
+    "log_level": "info",
+    "tls_enabled": true,
+    "max_connections": 512,
+    "feature_flags": {
+      "new_batcher": true,
+      "cache": true
+    }
+  }
+}

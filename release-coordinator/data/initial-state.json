@@ -1,0 +1,66 @@
+{
+  "group": "core",
+  "description": "Bundled initial effective configuration. Service JSON state files are seeded from this on first start.",
+  "services": {
+    "svc-1": {
+      "version": "v1.0.0",
+      "content": {
+        "role": "web",
+        "listen_port": 9101,
+        "log_level": "warning",
+        "max_connections": 128,
+        "feature_flags": {"new_batcher": false}
+      }
+    },
+    "svc-2": {
+      "version": "v1.0.0",
+      "content": {
+        "role": "web",
+        "listen_port": 9102,
+        "log_level": "warning",
+        "max_connections": 128,
+        "feature_flags": {"new_batcher": false}
+      }
+    },
+    "svc-3": {
+      "version": "v1.4.2",
+      "content": {
+        "role": "api",
+        "listen_port": 9103,
+        "log_level": "info",
+        "max_connections": 256,
+        "feature_flags": {"new_batcher": false, "cache": true}
+      }
+    },
+    "svc-4": {
+      "version": "v1.4.2",
+      "content": {
+        "role": "api",
+        "listen_port": 9104,
+        "log_level": "info",
+        "max_connections": 256,
+        "feature_flags": {"new_batcher": false, "cache": true}
+      }
+    },
+    "svc-5": {
+      "version": "v0.9.7",
+      "content": {
+        "role": "worker",
+        "listen_port": 9105,
+        "log_level": "error",
+        "concurrency": 8,
+        "feature_flags": {"new_batcher": false}
+      }
+    },
+    "svc-6": {
+      "version": "v0.9.7",
+      "content": {
+        "role": "worker",
+        "listen_port": 9106,
+        "log_level": "error",
+        "concurrency": 8,
+        "feature_flags": {"new_batcher": false}
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "version": "v3.0.0-canary",
+  "content": {
+    "release_channel": "canary",
+    "log_level": "debug",
+    "tls_enabled": true,
+    "max_connections": 1024,
+    "feature_flags": {
+      "new_batcher": true,
+      "cache": true,
+      "speculative_retry": true
+    }
+  }
+}

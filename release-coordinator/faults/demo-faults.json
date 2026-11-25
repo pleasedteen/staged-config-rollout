@@ -1,0 +1,27 @@
+{
+  "description": "Fault actions used by `python3 -m relcoord.demo`. Counters make packet/receipt loss finite so retries recover automatically.",
+  "service_faults": {
+    "svc-2": {
+      "drop_apply": 1,
+      "lose_receipt": 1,
+      "delay_seconds": 0.35,
+      "delay_next": 2
+    }
+  },
+  "restart_persistence_service": "svc-2",
+  "pause_phase": {
+    "stop_before_submit": ["svc-3"],
+    "stop_before_resume": ["svc-5"],
+    "batches": [
+      ["svc-1", "svc-2", "svc-3"],
+      ["svc-4", "svc-5"],
+      ["svc-6"]
+    ]
+  },
+  "notes": [
+    "drop_apply loses one publish instruction; the coordinator retries the same command id.",
+    "lose_receipt durably applies config but closes the first HTTP response.",
+    "The retry is observed as a duplicate command and does not append another config history entry.",
+    "Stopped services simulate loss of contact; restarting them replays persisted state."
+  ]
+}
