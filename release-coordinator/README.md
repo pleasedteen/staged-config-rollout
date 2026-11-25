@@ -31,6 +31,55 @@
 python3 -m unittest discover -s tests -v
 ```
 
+## 一条命令验证多组隔离和重启接手
+
+```bash
+./verify-groups.sh
+# 等价：python3 -m relcoord.group_verify
+```
+
+该命令只使用临时目录和空闲本地端口，会自动完成 19 项检查：
+
+1. 构造旧的单组 `cluster.json` / SQLite（`services.name PRIMARY KEY`）并原地迁移到 `(group_name, name)`；
+2. 在同一个 home 中启动 `core`、`canary` 两组，两组都有同名服务；
+3. 启动**一个**协调器管理所有组，验证全局后台探测/写入并发峰值恰好为 8；
+4. 卡住 `core/svc-1` 时，`canary` 的首批仍在慢注入结束前确认；
+5. 验证 `status/pause/resume/rollback --group ...` 只影响目标组；
+6. `kill -9` 协调器后启动新进程，从同一个 SQLite 接手持久 pause 决定；
+7. 回退 `canary` 后，`core` 的同名服务仍保持自己的版本。
+
+## 多组使用方式
+
+同一个 `RELCOORD_HOME` 可以重复 init 多个组；组内服务名唯一即可，不同组允许同名。新组的状态文件会放在 `services/<group>/` 下，旧单组的扁平 `services/<name>.json` 路径保持不变。
+
+```bash
+H=./runtime-groups
+
+./relctl init --home "$H" --group core \
+  --services svc-1,svc-2,svc-3 --ports 9401,9402,9403
+./relctl init --home "$H" --group canary \
+  --services svc-1,svc-2,svc-3 --ports 9411,9412,9413
+
+# 同名服务进程必须用 --group 区分
+python3 -m relcoord service --home "$H" --group core   --name svc-1 &
+python3 -m relcoord service --home "$H" --group canary --name svc-1 &
+
+python3 -m relcoord coordinator --home "$H"
+
+./relctl submit configs/target-v2.json --home "$H" --group core \
+  --batch svc-1 --batch svc-2,svc-3
+./relctl submit configs/target-v3.json --home "$H" --group canary \
+  --batch svc-1 --batch svc-2,svc-3
+
+./relctl status   --home "$H" --group canary --json
+./relctl status   --home "$H" --all-groups
+./relctl pause    --home "$H" --group core
+./relctl resume   --home "$H" --group core
+./relctl rollback --home "$H" --group canary
+```
+
+协调器内只有一个 8 worker 的请求调度器；探测、发布写入和回退写入都经过它，因此整个协调器进程同时最多有 8 个服务 HTTP 请求。各组有独立监管线程和公平队列，一组的慢请求不会阻塞另一组完成自己的批次。
+
 ## 手动启动
 
 ```bash

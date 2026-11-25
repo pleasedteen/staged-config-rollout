@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import threading
 import time
@@ -317,29 +318,43 @@ def make_handler(service: MockService) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def build_service(home: Path, name: str, state_path: str | Path | None = None) -> tuple[MockService, int, str]:
+def build_service(
+    home: Path,
+    name: str,
+    state_path: str | Path | None = None,
+    group: str | None = None,
+) -> tuple[MockService, int, str]:
     store = Store(home)
     cluster = store.load_cluster()
-    spec = next((s for s in cluster["services"] if s["name"] == name), None)
+    if group is None:
+        group = cluster.get("group", "core")
+    group_cfg = cluster["groups"].get(group)
+    if group_cfg is None:
+        raise SystemExit(f"unknown group {group!r}; cluster groups={list(cluster['groups'])}")
+    spec = next((s for s in group_cfg["services"] if s["name"] == name), None)
     if spec is None:
-        raise SystemExit(f"unknown service {name!r}; cluster has {[s['name'] for s in cluster['services']]}")
+        raise SystemExit(
+            f"unknown service {name!r} in group {group!r}; "
+            f"group has {[s['name'] for s in group_cfg['services']]}"
+        )
     path = Path(state_path or spec["state_path"])
     initial = load_initial_state()
     service = MockService(name, path, initial["services"])
-    return service, int(spec["port"]), cluster.get("host", "127.0.0.1")
+    return service, int(spec["port"]), group_cfg.get("host", cluster.get("host", "127.0.0.1"))
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one persistent local mock service")
     parser.add_argument("--home", default=str(DEFAULT_HOME), help="coordinator runtime home")
     parser.add_argument("--name", required=True, help="service name from cluster.json")
+    parser.add_argument("--group", default=os.environ.get("RELCOORD_GROUP"), help="service group (default: cluster.group or core)")
     parser.add_argument("--port", type=int, default=None, help="override listen port")
     parser.add_argument("--state", default=None, help="override persistent state JSON path")
     parser.add_argument("--faults-json", default=None, help="initial fault injection JSON")
     args = parser.parse_args(argv)
 
     home = Path(args.home)
-    service, cluster_port, host = build_service(home, args.name, args.state)
+    service, cluster_port, host = build_service(home, args.name, args.state, args.group)
     port = args.port or cluster_port
     if args.faults_json:
         service.update_faults(json.loads(args.faults_json))

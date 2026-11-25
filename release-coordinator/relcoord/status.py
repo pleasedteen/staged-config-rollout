@@ -10,28 +10,45 @@ from .storage import Store
 from .util import compact_json, parse_json_maybe
 
 
-def _live_states(services: list[Any], timeout: float = 0.65) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=max(4, len(services))) as pool:
+def _live_states(services: list[Any], timeout: float = 0.65) -> dict[tuple[str, str], dict[str, Any]]:
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    if not services:
+        return result
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(services)))) as pool:
         future_map = {
-            pool.submit(client.fetch_state, row["base_url"], timeout): row["name"]
+            pool.submit(client.fetch_state, row["base_url"], timeout): (
+                row["group_name"],
+                row["name"],
+            )
             for row in services
         }
         for future in future_map:
-            name = future_map[future]
+            key = future_map[future]
             try:
-                result[name] = {"ok": True, "state": future.result()}
+                result[key] = {"ok": True, "state": future.result()}
             except Exception as e:
-                result[name] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                result[key] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     return result
 
 
-def build_status(home: str | Path, *, live: bool = True) -> dict[str, Any]:
+def build_status(
+    home: str | Path,
+    *,
+    live: bool = True,
+    group: str | None = None,
+) -> dict[str, Any]:
     store = Store(home)
-    cluster = store.load_cluster()
-    services = store.list_services()
-    active = store.active_release(cluster.get("group", "core"))
-    release = active or store.latest_release(cluster.get("group", "core"))
+    try:
+        cluster = store.load_cluster()
+    except Exception:
+        cluster = {"group": group, "groups": {}}
+    group_name = group or cluster.get("group") or "core"
+    services = store.list_services(group_name)
+    group_cfg = cluster.get("groups", {}).get(group_name)
+    if group_cfg is None:
+        group_cfg = {"name": group_name, "services": [dict(row) for row in services]}
+    active = store.active_release(group_name)
+    release = active or store.latest_release(group_name)
     live_map = _live_states(services) if live else {}
 
     release_dict: dict[str, Any] | None = None
@@ -52,17 +69,24 @@ def build_status(home: str | Path, *, live: bool = True) -> dict[str, Any]:
         item["actual_content_parsed"] = parse_json_maybe(svc["actual_content"])
         item["release_state"] = rows_by_service.get(svc["name"])
         if live:
-            item["live"] = live_map.get(svc["name"], {"ok": False, "error": "not probed"})
+            item["live"] = live_map.get(
+                (svc["group_name"], svc["name"]),
+                {"ok": False, "error": "not probed"},
+            )
             if item["live"].get("ok"):
                 st = item["live"]["state"]
                 item["live_actual"] = st.get("effective")
                 item["live_fence"] = st.get("fence")
         service_items.append(item)
 
-    events = [dict(e) for e in store.recent_events(10)]
+    events = [dict(e) for e in store.recent_events(10, group_name)]
+    status_cluster = dict(cluster)
+    status_cluster["group"] = group_name
+    status_cluster["services"] = group_cfg["services"]
     return {
         "home": str(Path(home)),
-        "cluster": cluster,
+        "group": group_name,
+        "cluster": status_cluster,
         "release": release_dict,
         "services": service_items,
         "events": events,

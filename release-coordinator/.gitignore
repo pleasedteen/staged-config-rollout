@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .runtime/
 runtime/
+runtime-groups/
 .pytest_cache/
 *.sqlite3-wal
 *.sqlite3-shm
